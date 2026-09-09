@@ -417,6 +417,390 @@ def update_falco_production(production_id):
     return jsonify(state)
 
 
+# ============================================================
+# PRODUCTION ORCHESTRATOR V1
+# ============================================================
+
+def extract_veo_video_uri(result):
+    try:
+        return (
+            result["response"]
+            ["generateVideoResponse"]
+            ["generatedSamples"][0]
+            ["video"]["uri"]
+        )
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def extract_veo_failure_reason(result):
+    try:
+        reasons = (
+            result["response"]
+            ["generateVideoResponse"]
+            .get("raiMediaFilteredReasons")
+        )
+
+        if reasons:
+            return {
+                "type": "rai_media_filtered",
+                "reasons": reasons
+            }
+    except (KeyError, TypeError):
+        pass
+
+    if isinstance(result.get("error"), dict):
+        return {
+            "type": "veo_error",
+            "error": result["error"]
+        }
+
+    return {
+        "type": "no_video_uri",
+        "message": (
+            "Veo operation completed without a usable video_uri"
+        )
+    }
+
+
+def safe_plan_key(plan_key):
+    cleaned = "".join(
+        char
+        for char in str(plan_key)
+        if char.isalnum() or char in ("_", "-")
+    )
+
+    if not cleaned:
+        raise ValueError("Invalid plan key")
+
+    return cleaned[:80]
+
+
+def publish_veo_uri_for_production(
+    production_id,
+    plan_key,
+    video_uri
+):
+    parsed_url = urlparse(video_uri)
+
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.hostname
+        != "generativelanguage.googleapis.com"
+    ):
+        raise ValueError("Invalid Veo video URI")
+
+    response = requests.get(
+        video_uri,
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY
+        },
+        timeout=180
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            "Veo video download failed: "
+            f"{response.status_code} "
+            f"{response.text[:1000]}"
+        )
+
+    plan_slug = safe_plan_key(plan_key)
+
+    filename = (
+        f"{PRODUCTION_PREFIX}/"
+        f"{production_id}/clips/"
+        f"{plan_slug}.mp4"
+    )
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(filename)
+
+    # Deterministic filename makes retries idempotent.
+    blob.upload_from_string(
+        response.content,
+        content_type="video/mp4"
+    )
+
+    return filename
+
+
+@app.post("/productions/<production_id>/orchestrate")
+@require_falco_auth
+def orchestrate_falco_production(production_id):
+    """
+    Advance already-submitted Veo operations and publish completed clips.
+
+    V1 deliberately does not create new images, submit new Veo jobs,
+    or render the final montage. It safely advances the asynchronous
+    portion of an existing persisted production.
+    """
+
+    if not GEMINI_API_KEY:
+        return jsonify({
+            "error": "GEMINI_API_KEY is not configured"
+        }), 500
+
+    try:
+        state, generation, error = (
+            load_production_state(production_id)
+        )
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to load production state",
+            "details": str(e)
+        }), 500
+
+    if error == "invalid":
+        return jsonify({
+            "error": "Invalid production_id"
+        }), 400
+
+    if error == "missing":
+        return jsonify({
+            "error": "Production not found"
+        }), 404
+
+    if error == "corrupt":
+        return jsonify({
+            "error": "Production state is corrupt"
+        }), 500
+
+    plans = state.get("plans", {})
+
+    if not isinstance(plans, dict) or not plans:
+        return jsonify({
+            "production_id": production_id,
+            "status": state.get("status"),
+            "revision": state.get("revision"),
+            "advanced": False,
+            "next_action": "awaiting_plans"
+        })
+
+    summary = {
+        "published": [],
+        "processing": [],
+        "failed": [],
+        "waiting_for_submission": [],
+        "fallback_ready": []
+    }
+
+    for plan_key in sorted(plans.keys()):
+        plan = plans.get(plan_key)
+
+        if not isinstance(plan, dict):
+            summary["failed"].append({
+                "plan": plan_key,
+                "reason": "invalid_plan_state"
+            })
+            continue
+
+        if (
+            plan.get("mode") == "ffmpeg_image_fallback"
+            and plan.get("status") == "ready"
+        ):
+            summary["fallback_ready"].append(plan_key)
+            continue
+
+        video = plan.get("video")
+
+        if not isinstance(video, dict):
+            summary["waiting_for_submission"].append(
+                plan_key
+            )
+            continue
+
+        if video.get("filename"):
+            if video.get("status") != "published":
+                video["status"] = "published"
+
+            summary["published"].append(plan_key)
+            continue
+
+        operation_name = video.get("operation_name")
+
+        if not operation_name:
+            summary["waiting_for_submission"].append(
+                plan_key
+            )
+            continue
+
+        if not str(operation_name).startswith(
+            "models/veo-3.1-lite-generate-preview/operations/"
+        ):
+            video["status"] = "failed"
+            video["failure"] = {
+                "type": "invalid_operation_name"
+            }
+
+            summary["failed"].append({
+                "plan": plan_key,
+                "reason": "invalid_operation_name"
+            })
+            continue
+
+        status_url = (
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/"
+            + str(operation_name)
+        )
+
+        try:
+            response = requests.get(
+                status_url,
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY
+                },
+                timeout=60
+            )
+        except requests.RequestException as e:
+            video["status"] = "status_check_failed"
+            video["last_error"] = str(e)
+
+            summary["failed"].append({
+                "plan": plan_key,
+                "reason": "status_request_failed"
+            })
+            continue
+
+        if not response.ok:
+            video["status"] = "status_check_failed"
+            video["last_error"] = (
+                f"{response.status_code}: "
+                f"{response.text[:1000]}"
+            )
+
+            summary["failed"].append({
+                "plan": plan_key,
+                "reason": "status_request_failed"
+            })
+            continue
+
+        try:
+            result = response.json()
+        except ValueError:
+            video["status"] = "status_check_failed"
+            video["last_error"] = (
+                "Veo returned invalid JSON"
+            )
+
+            summary["failed"].append({
+                "plan": plan_key,
+                "reason": "invalid_status_json"
+            })
+            continue
+
+        if not result.get("done"):
+            video["status"] = "processing"
+            video["last_checked_at"] = utc_now_iso()
+
+            summary["processing"].append(plan_key)
+            continue
+
+        video_uri = extract_veo_video_uri(result)
+
+        if not video_uri:
+            video["status"] = "failed"
+            video["last_checked_at"] = utc_now_iso()
+            video["failure"] = (
+                extract_veo_failure_reason(result)
+            )
+
+            summary["failed"].append({
+                "plan": plan_key,
+                "reason": video["failure"]
+            })
+            continue
+
+        video["status"] = "done"
+        video["video_uri"] = video_uri
+        video["last_checked_at"] = utc_now_iso()
+
+        try:
+            filename = publish_veo_uri_for_production(
+                production_id,
+                plan_key,
+                video_uri
+            )
+        except Exception as e:
+            video["status"] = "publish_failed"
+            video["last_error"] = str(e)
+
+            summary["failed"].append({
+                "plan": plan_key,
+                "reason": "publish_failed"
+            })
+            continue
+
+        video["filename"] = filename
+        video["status"] = "published"
+        video["published_at"] = utc_now_iso()
+
+        summary["published"].append(plan_key)
+
+    usable_plan_count = (
+        len(summary["published"])
+        + len(summary["fallback_ready"])
+    )
+
+    total_plan_count = len(plans)
+
+    if usable_plan_count == total_plan_count:
+        state["status"] = "clips_ready"
+        next_action = "montage"
+    elif summary["processing"]:
+        state["status"] = "videos_processing"
+        next_action = "check_existing_operations"
+    elif summary["failed"]:
+        state["status"] = "blocked"
+        next_action = "retry_or_fallback_failed_plans"
+    else:
+        state["status"] = "videos_submitted"
+        next_action = "submit_missing_video_operations"
+
+    metadata = state.setdefault("metadata", {})
+
+    if isinstance(metadata, dict):
+        metadata["orchestrator_v1"] = {
+            "last_run_at": utc_now_iso(),
+            "next_action": next_action
+        }
+
+    state["updated_at"] = utc_now_iso()
+    state["revision"] = int(
+        state.get("revision", 0)
+    ) + 1
+
+    try:
+        save_production_state(
+            production_id,
+            state,
+            expected_generation=generation
+        )
+    except PreconditionFailed:
+        return jsonify({
+            "error": (
+                "Production state changed concurrently. "
+                "Reload and retry."
+            )
+        }), 409
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to persist orchestrator state",
+            "details": str(e)
+        }), 500
+
+    return jsonify({
+        "production_id": production_id,
+        "status": state["status"],
+        "revision": state["revision"],
+        "advanced": True,
+        "next_action": next_action,
+        "summary": summary
+    })
+
+
 @app.get("/health")
 def health():
     return jsonify({
