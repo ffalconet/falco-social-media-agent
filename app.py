@@ -455,7 +455,7 @@ def montage_simple():
             "error": "texts must be a list"
         }), 400
 
-    drawtext_filters = []
+    text_specs = []
 
     for index, text_item in enumerate(texts):
 
@@ -532,28 +532,15 @@ def montage_simple():
         font_color = color_map[color]
         y_position = text_position_map[position]
 
-        safe_text = (
-            str(text_value)
-            .replace("\\", "\\\\")
-            .replace(":", "\\:")
-            .replace("'", "\\'")
-            .replace(",", "\\,")
-            .replace("%", "\\%")
-            .replace("\n", " ")
-        )
-
-        drawtext = (
-            "drawtext="
-            f"fontfile='{font_path}':"
-            f"text='{safe_text}':"
-            f"fontcolor={font_color}:"
-            f"fontsize={size}:"
-            "x=(w-text_w)/2:"
-            f"y={y_position}:"
-            f"enable='between(t,{start_time},{end_time})'"
-        )
-
-        drawtext_filters.append(drawtext)
+        text_specs.append({
+            "text": str(text_value).replace("\n", " "),
+            "font_path": font_path,
+            "font_color": font_color,
+            "size": size,
+            "y_position": y_position,
+            "start_time": start_time,
+            "end_time": end_time
+        })
 
     # =========================================================
     # VALIDATION OPTIONAL FREE LOGO
@@ -1020,6 +1007,33 @@ def montage_simple():
             ]
 
         content_filter_parts = []
+        drawtext_filters = []
+
+        # Write user-facing text to UTF-8 files and let FFmpeg read it
+        # with textfile=. This avoids fragile escaping of apostrophes,
+        # accents, colons, commas and percent signs in filter_complex.
+        for index, spec in enumerate(text_specs):
+
+            text_path = (
+                tmpdir_path / f"drawtext_{index}.txt"
+            )
+
+            text_path.write_text(
+                spec["text"],
+                encoding="utf-8"
+            )
+
+            drawtext_filters.append(
+                "drawtext="
+                f"fontfile='{spec['font_path']}':"
+                f"textfile='{text_path.as_posix()}':"
+                "reload=0:"
+                f"fontcolor={spec['font_color']}:"
+                f"fontsize={spec['size']}:"
+                "x=(w-text_w)/2:"
+                f"y={spec['y_position']}:"
+                f"enable='between(t,{spec['start_time']},{spec['end_time']})'"
+            )
 
         if drawtext_filters:
 
