@@ -588,15 +588,224 @@ def publish_veo_uri_for_production(
     return filename
 
 
+
+def build_persisted_montage_payload(state):
+    montage = state.get("montage")
+
+    if not isinstance(montage, dict):
+        return None, ["montage"]
+
+    required_fields = [
+        "plan_durations",
+        "texts",
+        "transition",
+        "end_card"
+    ]
+
+    missing = [
+        field
+        for field in required_fields
+        if field not in montage
+    ]
+
+    if missing:
+        return None, missing
+
+    plan_durations = montage.get("plan_durations")
+
+    if not isinstance(plan_durations, dict):
+        return None, ["plan_durations"]
+
+    texts = montage.get("texts")
+
+    if not isinstance(texts, list):
+        return None, ["texts"]
+
+    transition = montage.get("transition")
+
+    if not isinstance(transition, dict):
+        return None, ["transition"]
+
+    end_card = montage.get("end_card")
+
+    if not isinstance(end_card, dict):
+        return None, ["end_card"]
+
+    logo = montage.get("logo", {
+        "enabled": False
+    })
+
+    if not isinstance(logo, dict):
+        return None, ["logo"]
+
+    plan_starts = montage.get("plan_starts", {})
+
+    if not isinstance(plan_starts, dict):
+        return None, ["plan_starts"]
+
+    plans = state.get("plans", {})
+
+    if not isinstance(plans, dict) or not plans:
+        return None, ["plans"]
+
+    clips = []
+
+    for plan_key in sorted(plans.keys()):
+        plan = plans.get(plan_key)
+
+        if not isinstance(plan, dict):
+            return None, [
+                f"plans.{plan_key}"
+            ]
+
+        duration = plan_durations.get(plan_key)
+
+        try:
+            duration = float(duration)
+
+            if duration <= 0 or duration > 30:
+                raise ValueError()
+
+        except (TypeError, ValueError):
+            return None, [
+                f"plan_durations.{plan_key}"
+            ]
+
+        start = plan_starts.get(plan_key, 0)
+
+        try:
+            start = float(start)
+
+            if start < 0:
+                raise ValueError()
+
+        except (TypeError, ValueError):
+            return None, [
+                f"plan_starts.{plan_key}"
+            ]
+
+        video = plan.get("video")
+
+        if (
+            isinstance(video, dict)
+            and video.get("filename")
+        ):
+            clips.append({
+                "type": "video",
+                "filename": video["filename"],
+                "start": start,
+                "duration": duration
+            })
+            continue
+
+        if (
+            plan.get("mode")
+            == "ffmpeg_image_fallback"
+        ):
+            source_image = (
+                plan.get("source_image")
+                or plan.get("keyframe_object_name")
+            )
+
+            if not source_image:
+                return None, [
+                    f"plans.{plan_key}.source_image"
+                ]
+
+            clips.append({
+                "type": "image",
+                "filename": source_image,
+                "start": 0,
+                "duration": duration
+            })
+            continue
+
+        return None, [
+            f"plans.{plan_key}.usable_asset"
+        ]
+
+    return {
+        "clips": clips,
+        "texts": texts,
+        "transition": transition,
+        "end_card": end_card,
+        "logo": logo
+    }, []
+
+
+def run_montage_from_persisted_state(state):
+    payload, missing = (
+        build_persisted_montage_payload(state)
+    )
+
+    if missing:
+        return {
+            "status": "missing_config",
+            "missing": missing
+        }
+
+    # Reuse the validated /montage-simple implementation directly.
+    # A nested Flask request context lets the existing endpoint keep
+    # its validation and rendering behavior without duplicating it.
+    with app.test_request_context(
+        "/montage-simple",
+        method="POST",
+        json=payload,
+        headers={
+            "Authorization": (
+                f"Bearer {FALCO_API_KEY}"
+            )
+        }
+    ):
+        response = montage_simple()
+
+    status_code = 200
+    response_object = response
+
+    if isinstance(response, tuple):
+        response_object = response[0]
+        status_code = response[1]
+
+    try:
+        body = response_object.get_json()
+    except Exception:
+        body = None
+
+    if status_code >= 400:
+        return {
+            "status": "error",
+            "http_status": status_code,
+            "details": body
+        }
+
+    if not isinstance(body, dict):
+        return {
+            "status": "error",
+            "http_status": 500,
+            "details": {
+                "error": (
+                    "montage-simple returned "
+                    "an invalid response"
+                )
+            }
+        }
+
+    return {
+        "status": "done",
+        "result": body
+    }
+
+
 @app.post("/productions/<production_id>/orchestrate")
 @require_falco_auth
 def orchestrate_falco_production(production_id):
     """
     Advance already-submitted Veo operations and publish completed clips.
 
-    V1.1 does not create images or render the final montage.
-    It may submit a missing Veo job only when the persisted plan already
-    contains both keyframe_object_name and video_prompt.
+    V1.2 does not create images. It may submit a missing Veo job only
+    when the persisted plan contains keyframe_object_name and video_prompt.
+    When all plans are usable, it may render the final montage only from
+    explicitly persisted montage configuration.
     """
 
     if not GEMINI_API_KEY:
@@ -647,7 +856,8 @@ def orchestrate_falco_production(production_id):
         "waiting_for_submission": [],
         "submitted": [],
         "missing_video_prompt": [],
-        "fallback_ready": []
+        "fallback_ready": [],
+        "montage": None
     }
 
     for plan_key in sorted(plans.keys()):
@@ -870,8 +1080,168 @@ def orchestrate_falco_production(production_id):
     total_plan_count = len(plans)
 
     if usable_plan_count == total_plan_count:
-        state["status"] = "clips_ready"
-        next_action = "montage"
+        montage_state = state.setdefault(
+            "montage",
+            {}
+        )
+
+        if (
+            isinstance(montage_state, dict)
+            and montage_state.get("filename")
+            and montage_state.get("video_url")
+        ):
+            montage_state["status"] = "completed"
+            state["status"] = "completed"
+            next_action = "none"
+
+            summary["montage"] = {
+                "status": "completed",
+                "filename": montage_state.get(
+                    "filename"
+                ),
+                "video_url": montage_state.get(
+                    "video_url"
+                )
+            }
+        else:
+            montage_run = (
+                run_montage_from_persisted_state(
+                    state
+                )
+            )
+
+            if (
+                montage_run.get("status")
+                == "missing_config"
+            ):
+                missing_config = montage_run.get(
+                    "missing",
+                    []
+                )
+
+                if not isinstance(
+                    montage_state,
+                    dict
+                ):
+                    montage_state = {}
+                    state["montage"] = (
+                        montage_state
+                    )
+
+                montage_state["status"] = (
+                    "awaiting_config"
+                )
+                montage_state["missing"] = (
+                    missing_config
+                )
+
+                state["status"] = (
+                    "awaiting_montage_config"
+                )
+                next_action = (
+                    "persist_montage_config"
+                )
+
+                summary["montage"] = {
+                    "status": "awaiting_config",
+                    "missing": missing_config
+                }
+
+            elif (
+                montage_run.get("status")
+                == "error"
+            ):
+                if not isinstance(
+                    montage_state,
+                    dict
+                ):
+                    montage_state = {}
+                    state["montage"] = (
+                        montage_state
+                    )
+
+                montage_state["status"] = (
+                    "failed"
+                )
+                montage_state["last_error"] = (
+                    montage_run.get("details")
+                )
+
+                state["status"] = "blocked"
+                next_action = "retry_montage"
+
+                summary["montage"] = {
+                    "status": "failed",
+                    "details": montage_run.get(
+                        "details"
+                    )
+                }
+
+            else:
+                result = montage_run["result"]
+
+                if not isinstance(
+                    montage_state,
+                    dict
+                ):
+                    montage_state = {}
+                    state["montage"] = (
+                        montage_state
+                    )
+
+                montage_state.update({
+                    "status": "completed",
+                    "filename": result.get(
+                        "filename"
+                    ),
+                    "video_id": result.get(
+                        "video_id"
+                    ),
+                    "video_url": result.get(
+                        "video_url"
+                    ),
+                    "content_duration": (
+                        result.get(
+                            "content_duration"
+                        )
+                    ),
+                    "final_duration": (
+                        result.get(
+                            "final_duration"
+                        )
+                    ),
+                    "transition_used": (
+                        result.get("transition")
+                    ),
+                    "end_card_used": (
+                        result.get("end_card")
+                    ),
+                    "completed_at": utc_now_iso()
+                })
+
+                state["status"] = "completed"
+                next_action = "none"
+
+                summary["montage"] = {
+                    "status": "completed",
+                    "filename": result.get(
+                        "filename"
+                    ),
+                    "video_url": result.get(
+                        "video_url"
+                    ),
+                    "content_duration": (
+                        result.get(
+                            "content_duration"
+                        )
+                    ),
+                    "final_duration": (
+                        result.get(
+                            "final_duration"
+                        )
+                    )
+                }
+
     elif summary["processing"]:
         state["status"] = "videos_processing"
         next_action = "check_existing_operations"
@@ -888,7 +1258,7 @@ def orchestrate_falco_production(production_id):
     metadata = state.setdefault("metadata", {})
 
     if isinstance(metadata, dict):
-        metadata["orchestrator_v1_1"] = {
+        metadata["orchestrator_v1_2"] = {
             "last_run_at": utc_now_iso(),
             "next_action": next_action
         }
