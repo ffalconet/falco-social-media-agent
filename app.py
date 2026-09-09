@@ -566,7 +566,7 @@ def update_falco_production(production_id):
 
 
 # ============================================================
-# PRODUCTION ORCHESTRATOR V1
+# PRODUCTION ORCHESTRATOR V1.3
 # ============================================================
 
 def extract_veo_video_uri(result):
@@ -609,6 +609,36 @@ def extract_veo_failure_reason(result):
             "Veo operation completed without a usable video_uri"
         )
     }
+
+
+
+def is_recoverable_veo_failure(failure):
+    if not isinstance(failure, dict):
+        return False
+
+    return failure.get("type") in {
+        "rai_media_filtered",
+        "no_video_uri"
+    }
+
+
+def apply_ffmpeg_fallback(plan, video, plan_key):
+    source_image = plan.get("keyframe_object_name")
+
+    if not source_image:
+        return False
+
+    plan["mode"] = "ffmpeg_image_fallback"
+    plan["source_image"] = source_image
+    plan["status"] = "ready"
+
+    video["status"] = "fallback"
+    video["fallback_reason"] = (
+        "Automatic fallback after one failed Veo retry"
+    )
+    video["fallback_at"] = utc_now_iso()
+
+    return True
 
 
 def safe_plan_key(plan_key):
@@ -950,10 +980,11 @@ def orchestrate_falco_production(production_id):
     """
     Advance already-submitted Veo operations and publish completed clips.
 
-    V1.2 does not create images. It may submit a missing Veo job only
-    when the persisted plan contains keyframe_object_name and video_prompt.
-    When all plans are usable, it may render the final montage only from
-    explicitly persisted montage configuration.
+    V1.3 adds bounded automatic recovery.
+    It does not create images. It may submit a missing Veo job only when
+    keyframe_object_name and video_prompt are persisted. Recoverable Veo
+    failures receive one automatic retry; a second recoverable failure
+    switches the plan to the validated FFmpeg image fallback.
     """
 
     if not GEMINI_API_KEY:
@@ -1003,6 +1034,7 @@ def orchestrate_falco_production(production_id):
         "failed": [],
         "waiting_for_submission": [],
         "submitted": [],
+        "retry_submitted": [],
         "missing_video_prompt": [],
         "fallback_ready": [],
         "montage": None
@@ -1178,16 +1210,117 @@ def orchestrate_falco_production(production_id):
         video_uri = extract_veo_video_uri(result)
 
         if not video_uri:
+            failure = extract_veo_failure_reason(
+                result
+            )
+
             video["status"] = "failed"
             plan["status"] = "video_failed"
             video["last_checked_at"] = utc_now_iso()
-            video["failure"] = (
-                extract_veo_failure_reason(result)
+            video["failure"] = failure
+
+            retry_count = int(
+                video.get("retry_count", 0) or 0
             )
+
+            if is_recoverable_veo_failure(failure):
+                keyframe_object_name = (
+                    plan.get("keyframe_object_name")
+                )
+                video_prompt = plan.get(
+                    "video_prompt"
+                )
+
+                if (
+                    retry_count < 1
+                    and keyframe_object_name
+                    and video_prompt
+                ):
+                    previous_operation = (
+                        video.get("operation_name")
+                    )
+
+                    try:
+                        retry_operation = (
+                            submit_veo_for_persisted_plan(
+                                str(
+                                    video_prompt
+                                ).strip(),
+                                keyframe_object_name
+                            )
+                        )
+                    except Exception as e:
+                        video["status"] = (
+                            "retry_submission_failed"
+                        )
+                        plan["status"] = "blocked"
+                        video["last_error"] = str(e)
+
+                        summary["failed"].append({
+                            "plan": plan_key,
+                            "reason": (
+                                "retry_submission_failed"
+                            )
+                        })
+                        continue
+
+                    history = video.setdefault(
+                        "operation_history",
+                        []
+                    )
+
+                    if previous_operation:
+                        history.append({
+                            "operation_name": (
+                                previous_operation
+                            ),
+                            "result": "failed",
+                            "failure": failure,
+                            "ended_at": utc_now_iso()
+                        })
+
+                    video["retry_count"] = (
+                        retry_count + 1
+                    )
+                    video["retry_of"] = (
+                        previous_operation
+                    )
+                    video["retry_reason"] = failure
+                    video["operation_name"] = (
+                        retry_operation
+                    )
+                    video["status"] = "processing"
+                    video["submitted_at"] = (
+                        utc_now_iso()
+                    )
+                    video.pop("video_uri", None)
+
+                    plan["status"] = (
+                        "video_processing"
+                    )
+
+                    summary[
+                        "retry_submitted"
+                    ].append(plan_key)
+                    summary["processing"].append(
+                        plan_key
+                    )
+                    continue
+
+                if retry_count >= 1:
+                    if apply_ffmpeg_fallback(
+                        plan,
+                        video,
+                        plan_key
+                    ):
+                        summary[
+                            "fallback_ready"
+                        ].append(plan_key)
+                        continue
 
             summary["failed"].append({
                 "plan": plan_key,
-                "reason": video["failure"]
+                "reason": failure
             })
             continue
 
@@ -1406,7 +1539,7 @@ def orchestrate_falco_production(production_id):
     metadata = state.setdefault("metadata", {})
 
     if isinstance(metadata, dict):
-        metadata["orchestrator_v1_2"] = {
+        metadata["orchestrator_v1_3"] = {
             "last_run_at": utc_now_iso(),
             "next_action": next_action
         }
