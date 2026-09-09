@@ -476,6 +476,68 @@ def safe_plan_key(plan_key):
     return cleaned[:80]
 
 
+def submit_veo_for_persisted_plan(
+    prompt,
+    image_object_name
+):
+    if not prompt:
+        raise ValueError("Missing persisted video_prompt")
+
+    if len(prompt) > 5000:
+        raise ValueError("Persisted video_prompt is too long")
+
+    image_b64, mime_type = get_gcs_image_as_base64(
+        image_object_name
+    )
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{MODEL}:predictLongRunning"
+    )
+
+    payload = {
+        "instances": [
+            {
+                "prompt": prompt,
+                "image": {
+                    "bytesBase64Encoded": image_b64,
+                    "mimeType": mime_type
+                }
+            }
+        ],
+        "parameters": {
+            "aspectRatio": "9:16"
+        }
+    }
+
+    response = requests.post(
+        url,
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=60
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            "Veo submission failed: "
+            f"{response.status_code} "
+            f"{response.text[:1500]}"
+        )
+
+    result = response.json()
+    operation_name = result.get("name")
+
+    if not operation_name:
+        raise RuntimeError(
+            "Veo submission returned no operation_name"
+        )
+
+    return operation_name
+
+
 def publish_veo_uri_for_production(
     production_id,
     plan_key,
@@ -532,9 +594,9 @@ def orchestrate_falco_production(production_id):
     """
     Advance already-submitted Veo operations and publish completed clips.
 
-    V1 deliberately does not create new images, submit new Veo jobs,
-    or render the final montage. It safely advances the asynchronous
-    portion of an existing persisted production.
+    V1.1 does not create images or render the final montage.
+    It may submit a missing Veo job only when the persisted plan already
+    contains both keyframe_object_name and video_prompt.
     """
 
     if not GEMINI_API_KEY:
@@ -583,6 +645,8 @@ def orchestrate_falco_production(production_id):
         "processing": [],
         "failed": [],
         "waiting_for_submission": [],
+        "submitted": [],
+        "missing_video_prompt": [],
         "fallback_ready": []
     }
 
@@ -606,14 +670,12 @@ def orchestrate_falco_production(production_id):
         video = plan.get("video")
 
         if not isinstance(video, dict):
-            summary["waiting_for_submission"].append(
-                plan_key
-            )
-            continue
+            video = {}
+            plan["video"] = video
 
         if video.get("filename"):
-            if video.get("status") != "published":
-                video["status"] = "published"
+            video["status"] = "published"
+            plan["status"] = "published"
 
             summary["published"].append(plan_key)
             continue
@@ -621,9 +683,65 @@ def orchestrate_falco_production(production_id):
         operation_name = video.get("operation_name")
 
         if not operation_name:
-            summary["waiting_for_submission"].append(
-                plan_key
+            keyframe_object_name = (
+                plan.get("keyframe_object_name")
             )
+            video_prompt = plan.get("video_prompt")
+
+            if not keyframe_object_name:
+                summary["waiting_for_submission"].append(
+                    plan_key
+                )
+                continue
+
+            if not video_prompt:
+                plan["status"] = "awaiting_video_prompt"
+                video["status"] = "not_submitted"
+
+                summary["missing_video_prompt"].append(
+                    plan_key
+                )
+                continue
+
+            try:
+                operation_name = (
+                    submit_veo_for_persisted_plan(
+                        str(video_prompt).strip(),
+                        keyframe_object_name
+                    )
+                )
+            except FileNotFoundError:
+                plan["status"] = "blocked"
+                video["status"] = "submission_failed"
+                video["last_error"] = (
+                    "Persisted keyframe image not found"
+                )
+
+                summary["failed"].append({
+                    "plan": plan_key,
+                    "reason": "keyframe_not_found"
+                })
+                continue
+            except Exception as e:
+                plan["status"] = "blocked"
+                video["status"] = "submission_failed"
+                video["last_error"] = str(e)
+
+                summary["failed"].append({
+                    "plan": plan_key,
+                    "reason": "veo_submission_failed"
+                })
+                continue
+
+            video["operation_name"] = operation_name
+            video["status"] = "processing"
+            video["submitted_at"] = utc_now_iso()
+            plan["status"] = "video_processing"
+
+            summary["submitted"].append(plan_key)
+            summary["processing"].append(plan_key)
+
+            # Do not immediately poll a freshly submitted operation.
             continue
 
         if not str(operation_name).startswith(
@@ -694,6 +812,7 @@ def orchestrate_falco_production(production_id):
         if not result.get("done"):
             video["status"] = "processing"
             video["last_checked_at"] = utc_now_iso()
+            plan["status"] = "video_processing"
 
             summary["processing"].append(plan_key)
             continue
@@ -702,6 +821,7 @@ def orchestrate_falco_production(production_id):
 
         if not video_uri:
             video["status"] = "failed"
+            plan["status"] = "video_failed"
             video["last_checked_at"] = utc_now_iso()
             video["failure"] = (
                 extract_veo_failure_reason(result)
@@ -714,6 +834,7 @@ def orchestrate_falco_production(production_id):
             continue
 
         video["status"] = "done"
+        plan["status"] = "video_done"
         video["video_uri"] = video_uri
         video["last_checked_at"] = utc_now_iso()
 
@@ -725,6 +846,7 @@ def orchestrate_falco_production(production_id):
             )
         except Exception as e:
             video["status"] = "publish_failed"
+            plan["status"] = "publish_failed"
             video["last_error"] = str(e)
 
             summary["failed"].append({
@@ -736,6 +858,7 @@ def orchestrate_falco_production(production_id):
         video["filename"] = filename
         video["status"] = "published"
         video["published_at"] = utc_now_iso()
+        plan["status"] = "published"
 
         summary["published"].append(plan_key)
 
@@ -755,6 +878,9 @@ def orchestrate_falco_production(production_id):
     elif summary["failed"]:
         state["status"] = "blocked"
         next_action = "retry_or_fallback_failed_plans"
+    elif summary["missing_video_prompt"]:
+        state["status"] = "awaiting_video_prompts"
+        next_action = "persist_missing_video_prompts"
     else:
         state["status"] = "videos_submitted"
         next_action = "submit_missing_video_operations"
@@ -762,7 +888,7 @@ def orchestrate_falco_production(production_id):
     metadata = state.setdefault("metadata", {})
 
     if isinstance(metadata, dict):
-        metadata["orchestrator_v1"] = {
+        metadata["orchestrator_v1_1"] = {
             "last_run_at": utc_now_iso(),
             "next_action": next_action
         }
