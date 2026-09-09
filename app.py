@@ -26,6 +26,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from google.api_core.exceptions import PreconditionFailed
 from google.cloud import storage
+from PIL import ImageFont
 
 app = Flask(__name__)
 
@@ -53,6 +54,153 @@ def get_gcs_image_as_base64(object_name):
         mime_type = "image/png"
 
     return base64.b64encode(image_bytes).decode("utf-8"), mime_type
+
+
+
+def wrap_text_to_pixel_width(
+    text,
+    font_path,
+    preferred_size,
+    max_width=910,
+    min_size=36,
+    max_lines=2
+):
+    """
+    Fit FALCO overlay text inside the 1080px vertical safe area.
+
+    The function measures Luciole glyphs with Pillow, wraps on words,
+    and progressively reduces the font size only when needed.
+    It prefers a maximum of two lines, but will use more lines at the
+    minimum size rather than allow text to overflow off-screen.
+    """
+
+    normalized = " ".join(
+        str(text).replace("\n", " ").split()
+    )
+
+    if not normalized:
+        return "", preferred_size, 0
+
+    preferred_size = int(preferred_size)
+    min_size = max(
+        24,
+        min(int(min_size), preferred_size)
+    )
+
+    def measure(font, value):
+        return float(font.getlength(value))
+
+    def split_long_word(font, word):
+        if measure(font, word) <= max_width:
+            return [word]
+
+        chunks = []
+        current = ""
+
+        for char in word:
+            candidate = current + char
+
+            if (
+                current
+                and measure(font, candidate) > max_width
+            ):
+                chunks.append(current)
+                current = char
+            else:
+                current = candidate
+
+        if current:
+            chunks.append(current)
+
+        return chunks
+
+    def wrap_with_font(font):
+        raw_words = normalized.split(" ")
+        words = []
+
+        for word in raw_words:
+            words.extend(
+                split_long_word(font, word)
+            )
+
+        lines = []
+        current = ""
+
+        for word in words:
+            candidate = (
+                word
+                if not current
+                else f"{current} {word}"
+            )
+
+            if (
+                current
+                and measure(font, candidate) > max_width
+            ):
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+
+        if current:
+            lines.append(current)
+
+        return lines
+
+    fallback = None
+
+    for size in range(
+        preferred_size,
+        min_size - 1,
+        -2
+    ):
+        font = ImageFont.truetype(
+            font_path,
+            size=size
+        )
+
+        lines = wrap_with_font(font)
+
+        if not lines:
+            return "", size, 0
+
+        widest = max(
+            measure(font, line)
+            for line in lines
+        )
+
+        fallback = (
+            lines,
+            size,
+            widest
+        )
+
+        if (
+            widest <= max_width
+            and len(lines) <= max_lines
+        ):
+            line_spacing = max(
+                8,
+                round(size * 0.20)
+            )
+
+            return (
+                "\n".join(lines),
+                size,
+                line_spacing
+            )
+
+    lines, size, _ = fallback
+    line_spacing = max(
+        8,
+        round(size * 0.20)
+    )
+
+    return (
+        "\n".join(lines),
+        size,
+        line_spacing
+    )
 
 
 def require_falco_auth(func):
@@ -1754,7 +1902,7 @@ def montage_simple():
         y_position = text_position_map[position]
 
         text_specs.append({
-            "text": str(text_value).replace("\n", " "),
+            "text": str(text_value),
             "font_path": font_path,
             "font_color": font_color,
             "size": size,
@@ -2235,12 +2383,34 @@ def montage_simple():
         # accents, colons, commas and percent signs in filter_complex.
         for index, spec in enumerate(text_specs):
 
+            try:
+                (
+                    fitted_text,
+                    fitted_size,
+                    line_spacing
+                ) = wrap_text_to_pixel_width(
+                    spec["text"],
+                    spec["font_path"],
+                    spec["size"],
+                    max_width=910,
+                    min_size=36,
+                    max_lines=2
+                )
+            except Exception as e:
+                return jsonify({
+                    "error": (
+                        "Failed to layout overlay text"
+                    ),
+                    "text_index": index,
+                    "details": str(e)
+                }), 500
+
             text_path = (
                 tmpdir_path / f"drawtext_{index}.txt"
             )
 
             text_path.write_text(
-                spec["text"],
+                fitted_text,
                 encoding="utf-8"
             )
 
@@ -2250,7 +2420,8 @@ def montage_simple():
                 f"textfile='{text_path.as_posix()}':"
                 "reload=0:"
                 f"fontcolor={spec['font_color']}:"
-                f"fontsize={spec['size']}:"
+                f"fontsize={fitted_size}:"
+                f"line_spacing={line_spacing}:"
                 "x=(w-text_w)/2:"
                 f"y={spec['y_position']}:"
                 f"enable='between(t,{spec['start_time']},{spec['end_time']})'"
