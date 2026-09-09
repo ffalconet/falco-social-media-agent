@@ -904,6 +904,71 @@ def montage_simple():
             normalized_files.append(
                 normalized_path
             )
+        
+        # =====================================================
+        # ASSEMBLE NORMALIZED CLIPS
+        # =====================================================
+
+        base_video_path = (
+            tmpdir_path / "base.mp4"
+        )
+
+        if not normalized_files:
+            return jsonify({
+                "error": "No normalized files available for montage"
+            }), 500
+
+        concat_file = (
+            tmpdir_path / "concat.txt"
+        )
+
+        with open(
+            concat_file,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            for normalized_file in normalized_files:
+                f.write(
+                    f"file '{normalized_file.as_posix()}'\n"
+                )
+
+        concat_command = [
+            "ffmpeg",
+            "-y",
+
+            "-f", "concat",
+            "-safe", "0",
+
+            "-i", str(concat_file),
+
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "21",
+            "-pix_fmt", "yuv420p",
+
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar", "48000",
+            "-ac", "2",
+
+            "-movflags", "+faststart",
+
+            str(base_video_path)
+        ]
+
+        result = subprocess.run(
+            concat_command,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            return jsonify({
+                "error": "FFmpeg base concat failed",
+                "details": result.stderr[-6000:]
+            }), 500
 
         # =====================================================
         # APPLY CONTENT TEXTS + OPTIONAL FREE LOGO
