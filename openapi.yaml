@@ -6,12 +6,150 @@ info:
     API privée utilisée par l'agent FALCO pour générer des vidéos verticales avec Veo 3.1 Lite,
     suivre leur génération, publier les fichiers vidéo, générer des images FALCO
     et assembler les contenus finaux.
-  version: 1.2.0
+  version: 1.3.0
 
 servers:
   - url: https://falco-video-api-549259282828.europe-west9.run.app
 
 paths:
+
+  /productions:
+    post:
+      operationId: createFalcoProduction
+      summary: Créer une production FALCO
+      description: Crée un état persistant pour une production et retourne son production_id.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type:
+                    - string
+                    - "null"
+                  maxLength: 200
+                  description: Nom lisible du post ou de la production.
+                metadata:
+                  type: object
+                  additionalProperties: true
+                  description: Métadonnées libres utiles à l'agent.
+      responses:
+        "201":
+          description: Production créée.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductionState"
+        "400":
+          description: Requête invalide.
+        "401":
+          description: Authentification refusée.
+        "409":
+          description: Conflit de création.
+        "500":
+          description: Erreur de stockage.
+
+  /productions/{production_id}:
+    get:
+      operationId: getFalcoProduction
+      summary: Lire une production FALCO
+      description: Retourne l'état persistant complet d'une production existante.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: production_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: UUID retourné par createFalcoProduction.
+      responses:
+        "200":
+          description: État de production.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductionState"
+        "400":
+          description: production_id invalide.
+        "401":
+          description: Authentification refusée.
+        "404":
+          description: Production introuvable.
+        "500":
+          description: État illisible ou erreur de stockage.
+
+    patch:
+      operationId: updateFalcoProduction
+      summary: Mettre à jour une production
+      description: Fusionne les champs fournis dans l'état persistant sans remplacer les autres étapes.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: production_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: UUID de la production.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                label:
+                  type:
+                    - string
+                    - "null"
+                  maxLength: 200
+                status:
+                  type: string
+                  maxLength: 80
+                master_image:
+                  type:
+                    - object
+                    - "null"
+                  additionalProperties: true
+                plans:
+                  type:
+                    - object
+                    - "null"
+                  additionalProperties: true
+                montage:
+                  type:
+                    - object
+                    - "null"
+                  additionalProperties: true
+                metadata:
+                  type:
+                    - object
+                    - "null"
+                  additionalProperties: true
+              additionalProperties: false
+      responses:
+        "200":
+          description: Production mise à jour.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductionState"
+        "400":
+          description: Patch invalide.
+        "401":
+          description: Authentification refusée.
+        "404":
+          description: Production introuvable.
+        "409":
+          description: Mise à jour concurrente détectée.
+        "500":
+          description: Erreur de stockage.
 
   /generate:
     post:
@@ -560,7 +698,57 @@ paths:
 
 components:
 
-  schemas: {}
+  schemas:
+
+    ProductionState:
+      type: object
+      required:
+        - schema_version
+        - production_id
+        - status
+        - created_at
+        - updated_at
+        - revision
+        - plans
+        - montage
+        - metadata
+      properties:
+        schema_version:
+          type: integer
+          example: 1
+        production_id:
+          type: string
+          description: UUID stable de la production.
+        label:
+          type:
+            - string
+            - "null"
+        status:
+          type: string
+          example: created
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        revision:
+          type: integer
+          minimum: 1
+        master_image:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+        plans:
+          type: object
+          additionalProperties: true
+        montage:
+          type: object
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
 
   securitySchemes:
 
