@@ -6,7 +6,7 @@ info:
     API privée utilisée par l'agent FALCO pour générer des vidéos verticales avec Veo 3.1 Lite,
     suivre leur génération, publier les fichiers vidéo, générer des images FALCO
     et assembler les contenus finaux.
-  version: 1.6.0
+  version: 1.7.0
 
 servers:
   - url: https://falco-video-api-549259282828.europe-west9.run.app
@@ -157,9 +157,9 @@ paths:
       summary: Avancer une production FALCO
       description: >
         Contrôle les opérations Veo persistées, publie les clips terminés,
-        soumet un Veo manquant uniquement avec un video_prompt persisté et,
-        lorsque tous les plans sont prêts, lance le montage final uniquement
-        depuis une configuration de montage déjà persistée. N'invente rien.
+        soumet les Veo manquants depuis les prompts persistés et gère les
+        échecs récupérables avec un seul retry automatique puis fallback
+        FFmpeg image. Lance le montage final depuis la config persistée.
       security:
         - bearerAuth: []
       parameters:
