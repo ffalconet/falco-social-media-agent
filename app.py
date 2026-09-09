@@ -1,4 +1,5 @@
 import base64
+import json
 import mimetypes
 from flask import Response
 
@@ -22,7 +23,8 @@ from flask import Flask, request, jsonify
 from flask import send_file
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from google.api_core.exceptions import PreconditionFailed
 from google.cloud import storage
 
 app = Flask(__name__)
@@ -74,6 +76,345 @@ def require_falco_auth(func):
         return func(*args, **kwargs)
 
     return wrapper
+
+
+
+# ============================================================
+# PRODUCTION STATE V1
+# ============================================================
+
+PRODUCTION_PREFIX = "falco/productions"
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def validate_production_id(production_id):
+    try:
+        uuid.UUID(production_id)
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def production_object_name(production_id):
+    return (
+        f"{PRODUCTION_PREFIX}/"
+        f"{production_id}/state.json"
+    )
+
+
+def merge_state_dict(target, patch):
+    """Recursively merge patch into target without replacing whole subtrees."""
+    for key, value in patch.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(target.get(key), dict)
+        ):
+            merge_state_dict(target[key], value)
+        else:
+            target[key] = value
+
+    return target
+
+
+def load_production_state(production_id):
+    if not validate_production_id(production_id):
+        return None, None, "invalid"
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(
+        production_object_name(production_id)
+    )
+
+    if not blob.exists():
+        return None, None, "missing"
+
+    blob.reload()
+
+    try:
+        state = json.loads(
+            blob.download_as_text(
+                encoding="utf-8"
+            )
+        )
+    except (ValueError, TypeError):
+        return None, None, "corrupt"
+
+    return state, blob.generation, None
+
+
+def save_production_state(
+    production_id,
+    state,
+    expected_generation=None
+):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(
+        production_object_name(production_id)
+    )
+
+    payload = json.dumps(
+        state,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True
+    )
+
+    if expected_generation is None:
+        blob.upload_from_string(
+            payload,
+            content_type="application/json",
+            if_generation_match=0
+        )
+    else:
+        blob.upload_from_string(
+            payload,
+            content_type="application/json",
+            if_generation_match=expected_generation
+        )
+
+
+@app.post("/productions")
+@require_falco_auth
+def create_falco_production():
+
+    data = request.get_json(silent=True) or {}
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "error": "Request body must be an object"
+        }), 400
+
+    label = data.get("label")
+
+    if label is not None:
+        if (
+            not isinstance(label, str)
+            or not label.strip()
+            or len(label.strip()) > 200
+        ):
+            return jsonify({
+                "error": (
+                    "label must be a non-empty string "
+                    "of at most 200 characters"
+                )
+            }), 400
+
+        label = label.strip()
+
+    metadata = data.get("metadata", {})
+
+    if not isinstance(metadata, dict):
+        return jsonify({
+            "error": "metadata must be an object"
+        }), 400
+
+    production_id = str(uuid.uuid4())
+    now = utc_now_iso()
+
+    state = {
+        "schema_version": 1,
+        "production_id": production_id,
+        "label": label,
+        "status": "created",
+        "created_at": now,
+        "updated_at": now,
+        "revision": 1,
+        "master_image": None,
+        "plans": {},
+        "montage": {},
+        "metadata": metadata
+    }
+
+    try:
+        save_production_state(
+            production_id,
+            state
+        )
+    except PreconditionFailed:
+        return jsonify({
+            "error": "Production ID conflict"
+        }), 409
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to create production state",
+            "details": str(e)
+        }), 500
+
+    return jsonify(state), 201
+
+
+@app.get("/productions/<production_id>")
+@require_falco_auth
+def get_falco_production(production_id):
+
+    try:
+        state, generation, error = (
+            load_production_state(production_id)
+        )
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to load production state",
+            "details": str(e)
+        }), 500
+
+    if error == "invalid":
+        return jsonify({
+            "error": "Invalid production_id"
+        }), 400
+
+    if error == "missing":
+        return jsonify({
+            "error": "Production not found"
+        }), 404
+
+    if error == "corrupt":
+        return jsonify({
+            "error": "Production state is corrupt"
+        }), 500
+
+    return jsonify(state)
+
+
+@app.patch("/productions/<production_id>")
+@require_falco_auth
+def update_falco_production(production_id):
+
+    data = request.get_json(silent=True) or {}
+
+    if not isinstance(data, dict) or not data:
+        return jsonify({
+            "error": "Patch body must be a non-empty object"
+        }), 400
+
+    allowed_fields = {
+        "label",
+        "status",
+        "master_image",
+        "plans",
+        "montage",
+        "metadata"
+    }
+
+    unknown_fields = (
+        set(data.keys()) - allowed_fields
+    )
+
+    if unknown_fields:
+        return jsonify({
+            "error": "Unsupported production fields",
+            "fields": sorted(unknown_fields)
+        }), 400
+
+    if "label" in data:
+        label = data["label"]
+
+        if label is not None and (
+            not isinstance(label, str)
+            or not label.strip()
+            or len(label.strip()) > 200
+        ):
+            return jsonify({
+                "error": (
+                    "label must be null or a non-empty "
+                    "string of at most 200 characters"
+                )
+            }), 400
+
+        if isinstance(label, str):
+            data["label"] = label.strip()
+
+    if "status" in data:
+        status_value = data["status"]
+
+        if (
+            not isinstance(status_value, str)
+            or not status_value.strip()
+            or len(status_value.strip()) > 80
+        ):
+            return jsonify({
+                "error": (
+                    "status must be a non-empty string "
+                    "of at most 80 characters"
+                )
+            }), 400
+
+        data["status"] = status_value.strip()
+
+    for field in [
+        "master_image",
+        "plans",
+        "montage",
+        "metadata"
+    ]:
+        if (
+            field in data
+            and data[field] is not None
+            and not isinstance(data[field], dict)
+        ):
+            return jsonify({
+                "error": f"{field} must be an object or null"
+            }), 400
+
+    try:
+        state, generation, error = (
+            load_production_state(production_id)
+        )
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to load production state",
+            "details": str(e)
+        }), 500
+
+    if error == "invalid":
+        return jsonify({
+            "error": "Invalid production_id"
+        }), 400
+
+    if error == "missing":
+        return jsonify({
+            "error": "Production not found"
+        }), 404
+
+    if error == "corrupt":
+        return jsonify({
+            "error": "Production state is corrupt"
+        }), 500
+
+    merge_state_dict(
+        state,
+        data
+    )
+
+    state["updated_at"] = utc_now_iso()
+    state["revision"] = int(
+        state.get("revision", 0)
+    ) + 1
+
+    try:
+        save_production_state(
+            production_id,
+            state,
+            expected_generation=generation
+        )
+    except PreconditionFailed:
+        return jsonify({
+            "error": (
+                "Production state changed concurrently. "
+                "Reload and retry."
+            )
+        }), 409
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to update production state",
+            "details": str(e)
+        }), 500
+
+    return jsonify(state)
 
 
 @app.get("/health")
