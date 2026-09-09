@@ -1,0 +1,572 @@
+openapi: 3.1.0
+
+info:
+  title: FALCO Video API
+  description: >
+    API privée utilisée par l'agent FALCO pour générer des vidéos verticales avec Veo 3.1 Lite,
+    suivre leur génération, publier les fichiers vidéo, générer des images FALCO
+    et assembler les contenus finaux.
+  version: 1.2.0
+
+servers:
+  - url: https://falco-video-api-549259282828.europe-west9.run.app
+
+paths:
+
+  /generate:
+    post:
+      operationId: generateFalcoVideo
+      summary: Générer une vidéo FALCO
+      description: >
+         Génère une vidéo Veo 3.1 Lite à partir d'un prompt,
+         ou d'une keyframe via image_object_name.
+         Retourne un operation_name pour suivre la génération.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - prompt
+              properties:
+
+                prompt:
+                  type: string
+                  maxLength: 5000
+                  description: >
+                    Prompt détaillé décrivant le mouvement, l'action et le comportement
+                    du plan vidéo à générer. En image-to-video, le prompt doit préserver
+                    strictement l'identité, la tenue, l'environnement et les objets
+                    présents dans la keyframe source.
+
+                aspect_ratio:
+                  type: string
+                  enum:
+                    - "9:16"
+                  default: "9:16"
+                  description: Format vertical FALCO.
+
+                image_object_name:
+                  type: string
+                  description: >
+                    Nom d'objet GCS de la keyframe à utiliser comme image initiale
+                    pour une génération image-to-video.
+                    Exemple :
+                    falco/images/178a116b-0162-4fe4-bd8a-047a867aa456.jpg.
+                    Si ce paramètre est absent, la génération fonctionne en text-to-video.
+
+      responses:
+        "200":
+          description: Génération soumise à Veo.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+
+                  status:
+                    type: string
+                    example: submitted
+
+                  operation_name:
+                    type: string
+                    description: >
+                      Identifiant de l'opération Veo à transmettre ensuite
+                      à getFalcoVideoStatus.
+
+                  mode:
+                    type: string
+                    enum:
+                      - text-to-video
+                      - image-to-video
+                    description: Mode de génération utilisé.
+
+                  image_object_name:
+                    type:
+                      - string
+                      - "null"
+                    description: >
+                      Image source utilisée pour l'image-to-video.
+                      Null en mode text-to-video.
+
+        "400":
+          description: Requête invalide.
+
+        "401":
+          description: Authentification refusée.
+
+        "404":
+          description: Image source introuvable.
+
+        "500":
+          description: Erreur serveur.
+
+        "502":
+          description: Erreur de communication avec Veo.
+
+  /status:
+    get:
+      operationId: getFalcoVideoStatus
+      summary: Vérifier l'état d'une génération
+      description: >
+        Vérifie si une génération Veo est encore en cours ou terminée.
+        Si elle est terminée, retourne le video_uri Google correspondant.
+      parameters:
+        - name: operation_name
+          in: query
+          required: true
+          description: Identifiant retourné précédemment par generateFalcoVideo.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: État de la génération.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  done:
+                    type: boolean
+                  video_uri:
+                    type: string
+
+        "400":
+          description: operation_name invalide.
+
+        "401":
+          description: Authentification refusée.
+
+        "500":
+          description: Erreur serveur.
+
+  /publish:
+    post:
+      operationId: publishFalcoVideo
+      summary: Publier une vidéo FALCO générée
+      description: >
+        Télécharge une vidéo Veo terminée, la stocke dans le bucket privé FALCO
+        et retourne une URL stable via le proxy vidéo Cloud Run.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - video_uri
+              properties:
+
+                video_uri:
+                  type: string
+                  description: >
+                    URI Gemini/Veo retournée par getFalcoVideoStatus.
+
+      responses:
+
+        "200":
+          description: Vidéo publiée avec succès.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+
+                  status:
+                    type: string
+                    example: published
+
+                  filename:
+                    type: string
+                    description: >
+                      Chemin GCS de la vidéo publiée.
+                    example: falco/49d273ae-431c-4e60-92fa-7553424741d8.mp4
+
+                  video_id:
+                    type: string
+                    description: >
+                      UUID stable de la vidéo publiée.
+                    example: 49d273ae-431c-4e60-92fa-7553424741d8
+
+                  video_url:
+                    type: string
+                    format: uri
+                    description: >
+                      URL stable permettant d'ouvrir la vidéo via le proxy FALCO.
+                    example: >
+                      https://falco-video-api-549259282828.europe-west9.run.app/video/49d273ae-431c-4e60-92fa-7553424741d8
+
+        "400":
+          description: Requête invalide.
+
+        "401":
+          description: Authentification refusée.
+
+        "500":
+          description: Erreur serveur ou stockage GCS.
+
+        "502":
+          description: Erreur lors du téléchargement de la vidéo Veo.
+
+  /montage-simple:
+    post:
+      operationId: montageFalcoVideo
+      summary: Assemble les clips et produit la vidéo FALCO finale
+      description: >
+        Assemble de 2 à 5 clips vidéo FALCO, applique les découpes,
+        ajoute éventuellement des textes et un logo,
+        puis ajoute automatiquement la end-card premium FALCO verrouillée.
+
+      security:
+        - bearerAuth: []
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - clips
+
+              properties:
+
+                clips:
+                  type: array
+                  minItems: 2
+                  maxItems: 5
+                  description: Clips vidéo déjà publiés dans le bucket FALCO.
+                  items:
+                    type: object
+                    required:
+                      - filename
+                      - duration
+                    properties:
+
+                      filename:
+                        type: string
+                        description: >
+                          Chemin GCS relatif du clip,
+                          par exemple falco/abc123.mp4.
+
+                      start:
+                        type: number
+                        minimum: 0
+                        default: 0
+                        description: Seconde de début du passage à utiliser.
+
+                      duration:
+                        type: number
+                        minimum: 0.1
+                        maximum: 30
+                        description: Durée du passage utilisé en secondes.
+
+                      type:
+                        type: string
+                        enum:
+                          - video
+                          - image
+                        default: video
+                        description: >
+                          Type d'asset. Image permet d'utiliser une keyframe
+                          comme fallback vidéo avec mouvement subtil FFmpeg.
+
+                texts:
+                  type: array
+                  description: Textes FALCO affichés sur le contenu vidéo.
+                  items:
+                    type: object
+                    required:
+                      - text
+                      - start
+                      - end
+
+                    properties:
+
+                      text:
+                        type: string
+
+                      start:
+                        type: number
+                        minimum: 0
+
+                      end:
+                        type: number
+                        minimum: 0
+
+                      weight:
+                        type: string
+                        enum:
+                          - regular
+                          - bold
+                        default: bold
+
+                      size:
+                        type: integer
+                        minimum: 24
+                        maximum: 120
+                        default: 58
+
+                      position:
+                        type: string
+                        enum:
+                          - top
+                          - center
+                          - bottom
+                        default: bottom
+
+                      color:
+                        type: string
+                        enum:
+                          - blue
+                          - cream
+                          - black
+                          - light_grey
+                          - white
+                        default: cream
+
+                logo:
+                  type: object
+                  description: >
+                    Logo libre optionnel sur le contenu.
+                    Ne concerne pas la signature finale FALCO.
+
+                  properties:
+
+                    enabled:
+                      type: boolean
+                      default: false
+
+                    start:
+                      type: number
+                      minimum: 0
+
+                    end:
+                      type: number
+                      minimum: 0
+
+                    position:
+                      type: string
+                      enum:
+                        - top
+                        - center
+                        - bottom
+                      default: center
+
+                    width:
+                      type: integer
+                      minimum: 80
+                      maximum: 600
+                      default: 220
+
+                end_card:
+                  type: object
+                  description: >
+                    Signature finale officielle FALCO.
+                    Son design est verrouillé côté serveur.
+
+                  properties:
+
+                    enabled:
+                      type: boolean
+                      default: true
+
+                    duration:
+                      type: number
+                      minimum: 1
+                      maximum: 4
+                      default: 2
+                
+                transition:
+                  type: object
+                  description: >
+                    Transition discrète entre les clips FALCO.
+                    Cut par défaut. Crossfade recommandé pour adoucir
+                    les changements de plan.
+
+                  properties:
+
+                    type:
+                      type: string
+                      enum:
+                        - cut
+                        - crossfade
+                        - fade
+                      default: cut
+
+                    duration:
+                      type: number
+                      minimum: 0.10
+                      maximum: 0.50
+                      default: 0.20
+                      description: >
+                        Durée de la transition en secondes.
+                        Ignorée lorsque type = cut.
+
+      responses:
+        "200":
+          description: Montage FALCO terminé avec succès.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  filename:
+                    type: string
+                  content_duration:
+                    type: number
+                  final_duration:
+                    type: number
+                  end_card:
+                    type: object
+                  output:
+                    type: object
+                  transition:
+                    type: object
+
+        "400":
+          description: Paramètres de montage invalides.
+
+        "404":
+          description: Clip ou asset FALCO introuvable.
+
+        "500":
+          description: Erreur de rendu FFmpeg.
+
+  /generate-image:
+    post:
+      operationId: generateFalcoImage
+      summary: Générer une image FALCO
+      description: >
+        Génère et stocke une image FALCO.
+        reference_image permet de préserver la continuité
+        avec une image maître existante.
+
+      security:
+        - bearerAuth: []
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - prompt
+
+              properties:
+
+                prompt:
+                  type: string
+                  maxLength: 5000
+                  description: Prompt détaillé décrivant l'image FALCO à générer.
+
+                reference_image:
+                  type: string
+                  description: >
+                    Nom d'objet GCS d'une image maître FALCO existante.
+                    Exemple :
+                    falco/images/178a116b-0162-4fe4-bd8a-047a867aa456.jpg.
+
+      responses:
+        "200":
+          description: Image générée avec succès.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+
+                  status:
+                    type: string
+
+                  image_id:
+                    type: string
+
+                  object_name:
+                    type: string
+                    description: >
+                      Nom d'objet GCS à conserver pour les générations suivantes.
+
+                  image_url:
+                    type: string
+                    format: uri
+
+                  mime_type:
+                    type: string
+
+        "400":
+          description: Requête invalide.
+
+        "401":
+          description: Authentification refusée.
+
+        "404":
+          description: Image de référence introuvable.
+
+        "500":
+          description: Erreur serveur.
+
+        "502":
+          description: Erreur lors de la génération d'image.
+
+  /image/{image_id}:
+    get:
+      operationId: getFalcoImage
+      summary: Récupérer une image FALCO
+      description: >
+        Retourne l'image correspondant à un image_id précédemment généré
+        par generateFalcoImage.
+
+      parameters:
+        - name: image_id
+          in: path
+          required: true
+          description: UUID de l'image FALCO.
+          schema:
+            type: string
+
+      responses:
+        "200":
+          description: Image FALCO.
+          content:
+
+            image/png:
+              schema:
+                type: string
+                format: binary
+
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+
+            image/webp:
+              schema:
+                type: string
+                format: binary
+
+        "400":
+          description: image_id invalide.
+
+        "404":
+          description: Image introuvable.
+
+components:
+
+  schemas: {}
+
+  securitySchemes:
+
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+security:
+  - bearerAuth: []
