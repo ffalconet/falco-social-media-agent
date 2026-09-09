@@ -213,15 +213,9 @@ URL :
 https://falco-video-api-549259282828.europe-west9.run.app
 ```
 
-gcloud run deploy falco-video-api `
->>   --source . `
->>   --region europe-west9 `
->>   --allow-unauthenticated `
->>   --memory 2Gi `
->>   --cpu 2 `
->>   --concurrency 1 `
->>   --timeout 900 `
->>   --set-secrets="GEMINI_API_KEY=gemini-api-key:latest,FALCO_API_KEY=falco-api-key:latest"
+```text
+gcloud run deploy falco-video-api --source . --region europe-west9 --allow-unauthenticated --memory 2Gi --cpu 2  --concurrency 1 --timeout 900 --set-secrets="GEMINI_API_KEY=gemini-api-key:latest,FALCO_API_KEY=falco-api-key:latest"
+```
 
 ## Gestion des erreurs
 
