@@ -6,7 +6,7 @@ info:
     API privée utilisée par l'agent FALCO pour générer des vidéos verticales avec Veo 3.1 Lite,
     suivre leur génération, publier les fichiers vidéo, générer des images FALCO
     et assembler les contenus finaux.
-  version: 1.3.0
+  version: 1.4.0
 
 servers:
   - url: https://falco-video-api-549259282828.europe-west9.run.app
@@ -150,6 +150,57 @@ paths:
           description: Mise à jour concurrente détectée.
         "500":
           description: Erreur de stockage.
+
+  /productions/{production_id}/orchestrate:
+    post:
+      operationId: advanceFalcoProduction
+      summary: Avancer une production FALCO
+      description: >
+        Contrôle les opérations Veo déjà soumises d'une production persistante,
+        publie automatiquement les clips terminés et met à jour l'état.
+        Ne génère aucune nouvelle image et ne soumet aucun nouveau Veo.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: production_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: UUID de la production existante.
+      responses:
+        "200":
+          description: Production contrôlée et état repersisté.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  production_id:
+                    type: string
+                  status:
+                    type: string
+                  revision:
+                    type: integer
+                  advanced:
+                    type: boolean
+                  next_action:
+                    type: string
+                  summary:
+                    type: object
+                    additionalProperties: true
+        "400":
+          description: production_id ou opération persistée invalide.
+        "401":
+          description: Authentification refusée.
+        "404":
+          description: Production introuvable.
+        "409":
+          description: État modifié concurremment.
+        "500":
+          description: Erreur serveur ou persistance.
+        "502":
+          description: Erreur de communication avec Veo.
 
   /generate:
     post:
