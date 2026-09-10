@@ -1,0 +1,96 @@
+openapi: 3.1.0
+
+info:
+  title: FALCO Targeted Revision API
+  description: Action additionnelle pour réviser uniquement la vidéo d'un plan déjà publié dans une production FALCO terminée.
+  version: 1.4.1
+
+servers:
+  - url: https://falco-video-api-549259282828.europe-west9.run.app
+
+paths:
+  /productions/{production_id}/plans/{plan_key}/revise-video:
+    post:
+      operationId: retryFalcoPlanVideo
+      summary: Régénérer uniquement la vidéo d'un plan publié
+      description: >
+        Réouvre un seul plan d'une production completed, réutilise exactement sa keyframe persistée,
+        soumet une nouvelle génération Veo, conserve tous les autres plans et invalide uniquement
+        le rendu final du montage. Après succès, utiliser advanceFalcoProduction jusqu'à completed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: production_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: UUID de la production FALCO existante.
+        - name: plan_key
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Plan à corriger, par exemple plan_03.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - video_prompt
+              properties:
+                video_prompt:
+                  type: string
+                  minLength: 1
+                  maxLength: 5000
+                  description: Nouveau prompt vidéo validé pour ce plan uniquement.
+                reason:
+                  type: string
+                  maxLength: 500
+                  description: Motif de révision, par exemple locomotion glitch.
+              additionalProperties: false
+      responses:
+        "200":
+          description: Révision ciblée soumise à Veo et persistée.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  production_id:
+                    type: string
+                  plan_key:
+                    type: string
+                  status:
+                    type: string
+                  revision:
+                    type: integer
+                  revision_status:
+                    type: string
+                  operation_name:
+                    type: string
+                  next_action:
+                    type: string
+                  preserved:
+                    type: object
+                    additionalProperties: true
+        "400":
+          description: Requête invalide.
+        "401":
+          description: Authentification refusée.
+        "404":
+          description: Production, plan ou keyframe introuvable.
+        "409":
+          description: État incompatible ou révision déjà active.
+        "500":
+          description: Erreur de persistance.
+        "502":
+          description: Erreur lors de la soumission Veo.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
