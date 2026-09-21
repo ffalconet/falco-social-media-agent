@@ -14,9 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY v14.py .
 COPY v141.py .
+COPY v142.py .
 
 COPY fonts /app/fonts
 
 ENV PORT=8080
 
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 v141:app
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 v142:app
